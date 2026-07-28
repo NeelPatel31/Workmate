@@ -1,0 +1,57 @@
+services:
+  redis:
+    image: redis:latest
+    container_name: workmate-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  sandbox:
+    build:
+      context: ./app/container_handlers
+      dockerfile: Dockerfile
+    image: sandbox:latest
+    container_name: sandbox
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    volumes:
+      - ./sandbox_data:/sandbox_data
+
+  backend:
+    build: .
+    container_name: workmate_backend
+    command: uv run main.py
+    ports:
+      - "5001:5001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./sandbox_data:/app/sandbox_data
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      redis:
+        condition: service_healthy
+      sandbox:
+        condition: service_started
+
+  frontend:
+    build: .
+    container_name: workmate_frontend
+    command: streamlit run streamlit_app/app.py
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - API_BASE=http://backend:5001
+    depends_on:
+      - backend

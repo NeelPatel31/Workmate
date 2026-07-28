@@ -1,9 +1,0 @@
-services:
-  sandbox-env:
-    build:
-      context: .
-      dockerfile: dockerfile
-    image: sandbox-env:v1
-    container_name: sandbox-env
-    volumes:
-      - ./skills:/mnt/skills

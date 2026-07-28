@@ -13,3 +13,4 @@ wheels/
 
 # Session uploads and downloads
 files/
+sandbox_data/sessions/*

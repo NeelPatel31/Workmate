@@ -1,26 +1,20 @@
 import yaml
-import logging
 from pathlib import Path
 from typing import Optional
 
-from ..utils.constants import SKILL_DIR, LOCAL_SKILLS_DIR
+from ..container_handlers.constants import DEFAULT_SKILLS_DIR, VIRTUAL_WORKSPACE
+from ..utils import logger
 
-logger = logging.getLogger(__name__)
 
 SKILL_MANIFEST = "SKILL.md"
 
 
 def get_skill_path(skill_name: str) -> str:
-    """Return the container-side path for a skill."""
-    return f"{SKILL_DIR}/{skill_name}"
+    """Return the agent-facing virtual path for a skill."""
+    return f"{VIRTUAL_WORKSPACE}/skills/{skill_name}"
 
 
 def _parse_frontmatter(skill_md_path: Path) -> Optional[dict]:
-    """Parse YAML frontmatter from a SKILL.md file.
-
-    Expects the file to start with '---', followed by YAML content,
-    and closed by another '---'.  Returns the parsed dict or None on failure.
-    """
     try:
         text = skill_md_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -32,7 +26,6 @@ def _parse_frontmatter(skill_md_path: Path) -> Optional[dict]:
         logger.warning("No frontmatter found in %s", skill_md_path)
         return None
 
-    # Find the closing '---'
     end_idx = text.find("---", 3)
     if end_idx == -1:
         logger.warning("Unclosed frontmatter in %s", skill_md_path)
@@ -53,10 +46,8 @@ def _parse_frontmatter(skill_md_path: Path) -> Optional[dict]:
 
 
 def _escape_xml(value: str) -> str:
-    """Escape special XML characters in a string."""
     return (
-        value
-        .replace("&", "&amp;")
+        value.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
@@ -65,13 +56,6 @@ def _escape_xml(value: str) -> str:
 
 
 def _skill_to_xml(frontmatter: dict, container_path: str) -> Optional[str]:
-    """Convert a parsed skill frontmatter dict into an XML string.
-
-    Required fields: name, description.
-    Path is always included (derived from SKILL_DIR + skill name).
-    Optional fields are included when present: license, compatibility,
-    metadata (key-value pairs), allowed-tools.
-    """
     name = frontmatter.get("name")
     description = frontmatter.get("description")
 
@@ -90,7 +74,6 @@ def _skill_to_xml(frontmatter: dict, container_path: str) -> Optional[str]:
         f"  <path>{_escape_xml(container_path)}</path>",
     ]
 
-    # Optional fields
     license_val = frontmatter.get("license")
     if license_val:
         lines.append(f"  <license>{_escape_xml(str(license_val))}</license>")
@@ -120,18 +103,22 @@ def _skill_to_xml(frontmatter: dict, container_path: str) -> Optional[str]:
     return "\n".join(lines)
 
 
+def resolve_skills_dir() -> Path | None:
+    local_dir = DEFAULT_SKILLS_DIR
+
+    if local_dir.exists() and local_dir.is_dir():
+        logger.info("Using local skills dir: %s", local_dir)
+        return local_dir
+
+    logger.warning("No valid skills directory found at %s", local_dir)
+    return None
+
+
 def get_skills_xml() -> str:
-    """Scan the local skills directory and return all skills as an XML string.
+    skills_dir = resolve_skills_dir()
+    logger.info(f"Skills dir: {skills_dir}")
 
-    Each skill directory is expected to contain a SKILL.md with YAML
-    frontmatter (per the Agent Skills specification).  The returned string
-    is a newline-joined concatenation of individual ``<skill>`` blocks.
-
-    Returns an empty string if no valid skills are found.
-    """
-    skills_dir = Path(LOCAL_SKILLS_DIR)
-
-    if not skills_dir.is_dir():
+    if not skills_dir or not skills_dir.is_dir():
         logger.warning("Skills directory does not exist: %s", skills_dir)
         return ""
 
@@ -155,6 +142,5 @@ def get_skills_xml() -> str:
         if xml is not None:
             xml_blocks.append(xml)
 
+    logger.info(f"No. of skills: {len(xml_blocks)}")
     return "\n".join(xml_blocks)
-
-CURRENTLY_AVAILABE_SKILLS = get_skills_xml()

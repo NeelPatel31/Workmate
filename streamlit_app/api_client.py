@@ -1,84 +1,97 @@
-from __future__ import annotations
-
 import json
-from typing import Any, Generator
+from collections.abc import Iterator
+from io import BytesIO
+from typing import Any
 
 import httpx
 
-from config import API_BASE_URL
+STREAM_BLOCK_MS = 1000
 
 
-class ApiError(Exception):
-    def __init__(self, message: str, status_code: int | None = None):
-        super().__init__(message)
-        self.status_code = status_code
-
-
-def _raise_for_status(response: httpx.Response) -> None:
-    if response.is_success:
-        return
-    detail = response.text
-    try:
-        payload = response.json()
-        detail = payload.get("detail", detail)
-    except Exception:
-        pass
-    raise ApiError(str(detail), response.status_code)
-
-
-def upload_file(session_id: str, file_name: str, file_bytes: bytes) -> dict[str, str]:
-    with httpx.Client(base_url=API_BASE_URL, timeout=120.0) as client:
-        response = client.post(
-            "/upload-file",
-            data={"session_id": session_id},
-            files={"file": (file_name, file_bytes)},
-        )
-        _raise_for_status(response)
-        return response.json()
-
-
-def _parse_sse_events(response: httpx.Response) -> Generator[dict[str, Any], None, None]:
-    buffer = ""
-    for chunk in response.iter_text():
-        buffer += chunk
-        while "\n\n" in buffer:
-            block, buffer = buffer.split("\n\n", 1)
-            for line in block.split("\n"):
-                if line.startswith("data: "):
-                    yield json.loads(line[6:])
-
-
-def stream_chat(
+def start_graph(
+    api_base: str,
     session_id: str,
     user_query: str,
-    uploaded_files: list[dict[str, str]],
-) -> Generator[dict[str, Any], None, None]:
-    with httpx.Client(base_url=API_BASE_URL, timeout=600.0) as client:
-        with client.stream(
-            "POST",
-            "/stream-graph",
-            json={
-                "session_id": session_id,
-                "user_query": user_query,
-                "uploaded_files": uploaded_files,
-            },
-        ) as response:
-            _raise_for_status(response)
-            yield from _parse_sse_events(response)
+    files: list[Any] | None = None,
+) -> str:
+    """Start a graph run and return its Redis stream identifier."""
+    base = api_base.rstrip("/")
 
+    data = {"session_id": session_id, "user_query": user_query}
+    multipart_files: list[tuple[str, tuple[str, BytesIO, str]]] = []
 
-def refresh_session(session_id: str) -> dict[str, Any]:
-    with httpx.Client(base_url=API_BASE_URL, timeout=60.0) as client:
-        response = client.get("/refresh-session", params={"session_id": session_id})
-        _raise_for_status(response)
-        return response.json()
+    for upload in files or []:
+        name = getattr(upload, "name", None) or "upload"
+        raw = upload.getvalue() if hasattr(upload, "getvalue") else upload.read()
+        mime = getattr(upload, "type", None) or "application/octet-stream"
+        multipart_files.append(("files", (name, BytesIO(raw), mime)))
 
-
-def delete_upload(session_id: str, file_name: str) -> dict[str, str]:
-    with httpx.Client(base_url=API_BASE_URL, timeout=30.0) as client:
-        response = client.delete(
-            "/delete-upload",
-            params={"session_id": session_id, "file_name": file_name},
+    with httpx.Client(timeout=None) as client:
+        response = client.post(
+            f"{base}/send-message",
+            data=data,
+            files=multipart_files or None,
         )
-        _raise_for_status(response)
+        response.raise_for_status()
+        return response.json()["prompt_id"]
+
+
+def iter_stream_events(
+    api_base: str,
+    session_id: str,
+    prompt_id: str,
+) -> Iterator[dict[str, Any]]:
+    """Read SSE packets for an already-started graph run."""
+    base = api_base.rstrip("/")
+
+    with httpx.Client(timeout=None) as client:
+        last_id = "0-0"
+        ended = False
+
+        while not ended:
+            payload = {
+                "session_id": session_id,
+                "prompt_id": prompt_id,
+                "start_id": last_id,
+                "block_ms": STREAM_BLOCK_MS,
+            }
+            with client.stream(
+                "POST",
+                f"{base}/stream-events",
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    packet = json.loads(line[6:])
+                    entry_id = packet.get("id")
+                    if entry_id:
+                        last_id = entry_id
+                    yield packet
+                    if packet.get("event") == "stream.end":
+                        ended = True
+                        break
+
+
+def cancel_graph(api_base: str, session_id: str) -> dict[str, Any]:
+    """Request cancellation of the active generation for a session."""
+    with httpx.Client(timeout=None) as client:
+        response = client.post(f"{api_base.rstrip('/')}/thread-cancel/{session_id}")
+        response.raise_for_status()
         return response.json()
+
+
+def download_file(api_base: str, session_id: str, relative_path: str) -> bytes:
+    """Download a file from the server."""
+    params = {
+        "session_id": session_id,
+        "relative_path": relative_path,
+    }
+    with httpx.Client(timeout=None) as client:
+        response = client.get(
+            f"{api_base.rstrip('/')}/files/download",
+            params=params,
+        )
+        response.raise_for_status()
+        return response.content

@@ -1,11 +1,10 @@
 from typing import NotRequired
-from typing_extensions import TypedDict
 
-from langchain_core.messages import ToolMessage
-from langchain.tools import BaseTool, ToolRuntime, tool
 from langchain.agents import create_agent
-
+from langchain.tools import BaseTool, ToolRuntime, tool
+from langchain_core.messages import ToolMessage
 from langgraph.types import Command
+from typing_extensions import TypedDict
 
 from ..prompts import TASK_DESCRIPTION_PREFIX
 from ..state import DeepAgentState
@@ -20,21 +19,8 @@ class SubAgent(TypedDict):
     tools: NotRequired[list[str]]
 
 
-def _create_task_tool(tools, subagents: list[SubAgent], model, state_schema: DeepAgentState):
-    """Create a task delegation tool that enables context isolation through sub-agents.
-
-    This function implements the core pattern for spawning specialized sub-agents with isolated contexts, preventing context clash and confusion in complex multi-step tasks.
-
-    Args:
-        tools: List of available tools that can be assigned to sub-agents
-        subagents: List of specialized sub-agent configurations
-        model: The language model to use for all agents
-        state_schema: The state schema (typically DeepAgentState)
-
-    Returns:
-        A 'task' tool that can delegate work to specialized sub-agents
-    """
-    # Create agent registry
+def _create_task_tool(tools, subagents: list[SubAgent], model, state_schema):
+    """Create a task delegation tool that enables context isolation through sub-agents."""
     agents = {}
 
     # Build tool name mapping for selective tool assignment
@@ -53,7 +39,10 @@ def _create_task_tool(tools, subagents: list[SubAgent], model, state_schema: Dee
             # Default to all tools
             _tools = tools
         agents[_agent["name"]] = create_agent(
-            model, system_prompt=_agent["system_prompt"], tools=_tools, state_schema=state_schema
+            model,
+            system_prompt=_agent["system_prompt"],
+            tools=_tools,
+            state_schema=state_schema,
         )
 
     # Generate description of available sub-agents for the tool description
@@ -62,37 +51,32 @@ def _create_task_tool(tools, subagents: list[SubAgent], model, state_schema: Dee
     ]
 
     @tool(description=TASK_DESCRIPTION_PREFIX.format(other_agents=other_agents_string))
-    def task(
+    async def task(
         description: str,
         subagent_type: str,
         runtime: ToolRuntime,
     ):
-        """Delegate a task to a specialized sub-agent with isolated context.
-
-        This creates a fresh context for the sub-agent containing only the task description, preventing context pollution from the parent agent's conversation history.
-        """
-        # Validate requested agent type exists
+        """Delegate a task to a specialized sub-agent with isolated context."""
         if subagent_type not in agents:
-            msg = f"Error: invoked agent of type {subagent_type}, the only allowed types are {[f'`{k}`' for k in agents]}"
-            return Command(update={"messages": [ToolMessage(msg, tool_call_id=runtime.tool_call_id)]})
+            msg = (
+                f"Error: invoked agent of type {subagent_type}, the only allowed types are "
+                f"{[f'`{k}`' for k in agents]}"
+            )
+            return Command(
+                update={"messages": [ToolMessage(msg, tool_call_id=runtime.tool_call_id)]}
+            )
 
-        # Get the requested sub-agent
         sub_agent = agents[subagent_type]
+        state = dict(runtime.state)
+        state["messages"] = [{"role": "user", "content": description}]
+        result = await sub_agent.ainvoke(state)
 
-        # Create isolated context with only the task description
-        # This is the key to context isolation - no parent history
-        runtime.state["messages"] = [{"role": "user", "content": description}]
-
-        # Execute the sub-agent in isolation
-        result = sub_agent.invoke(runtime.state)
-
-        # Return results to parent agent via Command state update
         return Command(
             update={
                 "messages": [
-                    # Sub-agent result becomes a ToolMessage in parent context
                     ToolMessage(
-                        result["messages"][-1].content, tool_call_id=runtime.tool_call_id
+                        result["messages"][-1].content,
+                        tool_call_id=runtime.tool_call_id,
                     )
                 ],
             }
