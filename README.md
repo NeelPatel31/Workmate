@@ -1,6 +1,6 @@
 # Workmate AI
 
-Workmate AI is a Claude-like agent runtime clone for working with files in a sandboxed environment. It combines a chat interface, a LangGraph agent, a Docker-backed filesystem, tool execution, skill discovery, and artifact delivery into one local developer project.
+Workmate AI is a Claude-like agent runtime for working with files in a sandboxed environment. It combines a chat interface, a LangGraph agent, a Docker-backed filesystem, tool execution, skill discovery, and artifact delivery into one local developer project.
 
 The project explores how modern file-working agents can upload documents, inspect or transform them, generate new artifacts, and render visual explanations while keeping execution isolated from the host machine.
 
@@ -9,40 +9,42 @@ The project explores how modern file-working agents can upload documents, inspec
 ## Core Capabilities
 
 - Chat with an agent that can reason over uploaded files and generate new outputs.
-- Execute bash commands and Python scripts inside a Docker sandbox.
+- Execute bash commands and Python scripts inside a Docker sandbox with per-session isolation.
 - Work with plain-text files such as Markdown, CSV, JSON, HTML, YAML, Python, and logs.
 - Process document and data formats such as PDF, DOCX, PPTX, XLSX, and images using container-installed libraries.
-- Discover and use filesystem-based skills from `filesystem-env/skills`.
-- Stream model output, tool calls, generated files, and widgets back to the frontend.
+- Discover and use filesystem-based skills from `sandbox_data/default_skills`.
+- Stream model output, tool calls, generated files, and widgets through Redis-backed Server-Sent Events.
+- Cancel in-flight agent runs and track thread status per session.
 - Render self-contained HTML visualizations inside the chat UI.
 - Delegate visualization work to a specialized sub-agent.
 - Track multi-step work with built-in TODO tools.
 
 ## Architecture
 
-Workmate has three main layers:
+Workmate has four main layers:
 
 - **Frontend:** a Streamlit chat UI for file uploads, streaming responses, session files, and rendered widgets.
-- **Backend:** a FastAPI service that handles uploads, session refreshes, file delivery, and Server-Sent Events.
+- **Backend:** a FastAPI service that accepts messages, manages sessions, serves file downloads, and streams agent events.
+- **Event bus:** Redis stores stream tokens, prompt registration, and thread status so the API can stream results independently of the agent worker.
 - **Agent runtime:** a LangGraph/LangChain agent with tools for file operations, bash execution, skills, TODOs, sub-agent delegation, and HTML widget rendering.
 
-The Docker sandbox provides the agent's working filesystem:
+The Docker sandbox provides the agent's working filesystem. Host data under `sandbox_data` is bind-mounted into the container at `/sandbox_data`. Each session is isolated under `sessions/<session_id>/`, and the agent sees a virtual workspace at `/workspace`.
 
-| Path | Purpose |
-| --- | --- |
-| `/usr-data/uploads` | Files uploaded by the user |
-| `/scratchpad` | Temporary working directory for scripts and intermediate files |
-| `/usr-data/output` | Final artifacts generated for the user |
-| `/mnt/skills` | Mounted skills directory |
+| Virtual path | Host / container path | Purpose |
+| --- | --- | --- |
+| `/workspace/uploads` | `sandbox_data/sessions/<id>/uploads` | Files uploaded by the user |
+| `/workspace/scratchpad` | `sandbox_data/sessions/<id>/scratchpad` | Temporary working directory |
+| `/workspace/output` | `sandbox_data/sessions/<id>/output` | Final artifacts for the user |
+| `/workspace/skills` | `sandbox_data/default_skills` | Mounted skill library |
 
 ## Tech Stack
 
 - **Python 3.12**
 - **FastAPI**
 - **Streamlit**
-- **LangChain**
-- **LangGraph**
+- **LangChain / LangGraph**
 - **Azure OpenAI**
+- **Redis**
 - **Docker Compose**
 - **uv**
 - **LibreOffice and Python document/data libraries** inside the sandbox
@@ -52,19 +54,22 @@ The Docker sandbox provides the agent's working filesystem:
 ```text
 .
 |-- app/
-|   |-- api/                 # FastAPI routes and controllers
+|   |-- apis/                 # FastAPI routes and controllers
 |   |-- agent_registry/       # Agent, tools, prompts, middleware, sub-agents
-|   `-- utils/                # Constants and logging
-|-- filesystem-env/
-|   |-- docker-compose.yml    # Sandbox service
-|   |-- dockerfile            # Sandbox image
-|   `-- skills/               # Bundled agent skills
-|-- images/                   # README assets
+|   |-- container_handlers/   # Docker sandbox client, bash session, path helpers
+|   |-- config/               # Settings loaded from environment
+|   |-- utils/                # Logging, Redis helpers, filename utils
+|   `-- validation_models/    # Request/response models
+|-- sandbox_data/
+|   |-- default_skills/       # Bundled agent skills (pdf, docx, pptx, xlsx)
+|   `-- sessions/             # Per-session uploads, scratchpad, and output
 |-- streamlit_app/
 |   |-- app.py                # Streamlit entry point
-|   |-- api_client.py         # API client
-|   `-- components/           # UI components
-|-- files/                    # Local session uploads/downloads
+|   |-- api_client.py         # Backend API client
+|   `-- render.py             # Chat and widget rendering
+|-- images/                   # README assets
+|-- docker-compose.yml        # Redis, sandbox, backend, frontend
+|-- Dockerfile                # Backend/frontend app image
 |-- main.py                   # FastAPI entry point
 |-- pyproject.toml
 |-- uv.lock
@@ -79,12 +84,6 @@ The Docker sandbox provides the agent's working filesystem:
 - Docker Desktop or Docker Engine with Docker Compose
 - uv
 - Azure OpenAI credentials
-
-### Install Dependencies
-
-```bash
-uv sync
-```
 
 ### Configure Environment
 
@@ -117,41 +116,84 @@ Optional variables:
 
 | Variable | Description |
 | --- | --- |
-| `LANGCHAIN_API_KEY` | LangSmith API key |
-| `LANGCHAIN_TRACING_V2` | LangSmith tracing toggle |
-| `LANGCHAIN_PROJECT` | LangSmith project name |
-| `WORKMATE_API_URL` | Streamlit backend URL override |
+| `REDIS_HOST` | Redis host (`localhost` for local runs, `redis` inside Compose) |
+| `REDIS_PORT` | Redis port (`6379` inside Compose; use `6380` when the backend runs on the host against Compose Redis) |
+| `REDIS_DB` | Redis database index |
+| `LANGSMITH_TRACING` | Enable LangSmith tracing (`true` / `false`) |
+| `LANGSMITH_ENDPOINT` | LangSmith API endpoint |
+| `LANGSMITH_API_KEY` | LangSmith API key |
+| `LANGSMITH_PROJECT` | LangSmith project name |
+| `API_BASE` | Streamlit backend URL override |
 
-### Start the Sandbox
+### Option A: Run Everything with Docker Compose
 
 ```bash
-docker compose -f filesystem-env/docker-compose.yml up --build -d
+docker compose up --build
 ```
 
-### Start the Backend
+This starts:
+
+| Service | URL / port |
+| --- | --- |
+| Frontend (Streamlit) | http://localhost:8501 |
+| Backend (FastAPI) | http://localhost:5001 |
+| Redis | localhost:6380 → container 6379 |
+| Sandbox | Docker container named `sandbox` |
+
+API docs: http://localhost:5001/docs
+
+### Option B: Local Development
+
+Start Redis and the sandbox:
+
+```bash
+docker compose up redis sandbox --build -d
+```
+
+Install Python dependencies:
+
+```bash
+uv sync
+```
+
+If the backend runs on the host against Compose Redis, set:
+
+```bash
+REDIS_HOST=localhost
+REDIS_PORT=6380
+```
+
+Start the backend:
 
 ```bash
 uv run python main.py
 ```
 
-The API runs at `http://localhost:5001` by default.
-
-### Start the Frontend
+Start the frontend:
 
 ```bash
 uv run streamlit run streamlit_app/app.py
 ```
 
-Streamlit usually opens at `http://localhost:8501`.
+Streamlit usually opens at http://localhost:8501. The API runs at http://localhost:5001 by default.
 
 ## API
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| `POST` | `/upload-file` | Upload a file for a session and copy it into the sandbox |
-| `GET` | `/refresh-session` | Clear sandbox working directories for a session |
-| `DELETE` | `/delete-upload` | Remove an uploaded file from local storage and the sandbox |
-| `POST` | `/stream-graph` | Stream an agent run as Server-Sent Events |
+| `GET` | `/health` | Health check for Redis and LLM connectivity |
+| `POST` | `/send-message` | Accept a user message and optional files; returns a `prompt_id` |
+| `POST` | `/stream-events` | Stream agent events for a `prompt_id` as Server-Sent Events |
+| `GET` | `/thread-status/{session_id}` | Get the current generation status for a session |
+| `POST` | `/thread-cancel/{session_id}` | Cancel an in-flight agent run |
+| `GET` | `/files/download` | Download a session file from `uploads/` or `output/` |
+
+Typical chat flow:
+
+1. `POST /send-message` with `session_id`, `user_query`, and optional files.
+2. Receive `{ "prompt_id": "..." }`.
+3. `POST /stream-events` with `session_id` and `prompt_id` to consume SSE events.
+4. Optionally cancel with `POST /thread-cancel/{session_id}`.
 
 FastAPI docs are available at:
 
@@ -161,7 +203,7 @@ http://localhost:5001/docs
 
 ## Skills
 
-Skills are stored in `filesystem-env/skills` and mounted into the container at `/mnt/skills`.
+Skills are stored in `sandbox_data/default_skills` and exposed to the agent at `/workspace/skills`.
 
 Each skill is a directory with a `SKILL.md` file and optional supporting docs or scripts. The backend scans skill metadata from `SKILL.md` frontmatter and injects the available skills into the agent context through middleware.
 
@@ -174,7 +216,8 @@ Bundled skills:
 
 ## Current Limitations
 
-- **Single shared Docker environment:** the current implementation uses one sandbox container. Sessions are identified at the application layer, but execution still happens in the same running container.
+- **Single shared Docker sandbox:** execution still happens in one sandbox container. Sessions are isolated at the filesystem and bash-session layer, but they share the same container runtime.
+- **In-memory graph checkpoints:** conversation checkpoints use an in-memory saver, so agent state is not durable across backend restarts.
 - **No resource quotas per user/session:** CPU, memory, execution time, file size, and storage quotas are not yet enforced per session.
 - **Restricted dependency and network access:** installing new libraries at runtime and making arbitrary network connections are intentionally blocked or constrained to keep the sandbox safer.
 
@@ -332,7 +375,7 @@ Suggested workflow:
 1. Fork the repository.
 2. Create a focused feature branch.
 3. Make the change.
-4. Run the backend, frontend, and Docker sandbox locally.
+4. Run the backend, frontend, Redis, and Docker sandbox locally.
 5. Open a pull request with a clear description of the change.
 
 ## License
