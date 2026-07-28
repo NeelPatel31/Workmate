@@ -85,11 +85,13 @@ def _apply_packet(run: dict, packet: dict) -> bool:
         run["user_message"]["text"] = data.get("text", run["user_message"]["text"])
         run["user_message"]["files"] = data.get("files", [])
     elif event == "ai.tool_call":
+        # ai.token already streamed the prose; keep it once via flush, not again on tool_call.
+        streamed_text = run["ai_text_buffer"]
         _flush_ai_text(run)
         run["turn_messages"].append(
             {
                 "type": "ai_tool_call",
-                "text": data.get("text"),
+                "text": None if streamed_text else data.get("text"),
                 "tool_calls": data.get("tool_calls", []),
             }
         )
